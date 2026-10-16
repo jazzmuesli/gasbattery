@@ -1,0 +1,17 @@
+[package]
+name = "gasbattery"
+version = "0.1.0"
+edition = "2021"
+description = "Market makers for the Stromstadt electricity exchange: a 1 MWh battery (liquidity/arbitrage) and a gas peaker (marginal unit). Speaks lowlat's wire protocol."
+
+[[bin]]
+name = "gasbattery"
+path = "src/main.rs"
+
+# No external crates on purpose: std-only keeps the build self-contained on a
+# box without a C toolchain (musl + rust-lld), which is how this project builds.
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

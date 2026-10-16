@@ -45,6 +45,9 @@ struct Opts {
     product: i32,
     seconds: u64,
     interval_ms: u64,
+    /// Delivery-slot length in seconds; sizes each quote's energy (default 5 s,
+    /// matching the Stromstadt city).
+    slot_seconds: f64,
 }
 
 fn parse_args() -> Opts {
@@ -55,6 +58,7 @@ fn parse_args() -> Opts {
         product: 0,
         seconds: 0,
         interval_ms: 1000,
+        slot_seconds: 5.0,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(first) = args.first() {
@@ -84,6 +88,10 @@ fn parse_args() -> Opts {
             "--interval-ms" => {
                 i += 1;
                 o.interval_ms = args[i].parse().unwrap_or(1000);
+            }
+            "--slot-seconds" => {
+                i += 1;
+                o.slot_seconds = args[i].parse().unwrap_or(5.0);
             }
             _ => {}
         }
@@ -202,6 +210,7 @@ fn run_fleet(opts: &Opts) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_battery_unit(opts: &Opts, mut maker: Battery, label: String) -> std::io::Result<()> {
+    maker.set_slot_seconds(opts.slot_seconds);
     let mut client = LowlatClient::connect(&opts.host, opts.port)?;
     let mut live = LiveOrders::default();
     let mut side_of: HashMap<u64, bool> = HashMap::new();

@@ -27,12 +27,16 @@ impl Fleet {
     /// A small but representative German supply portfolio: three batteries of
     /// different sizes and five gas turbines spanning CCGT → OCGT → peaker.
     pub fn default_german() -> Self {
+        // Capacities are sized for the *district* market Stromstadt trades on
+        // (a ~20 MW residual load against the city's ~14 MW of merchant
+        // renewables), not for the whole country: at that scale the CCGT →
+        // OCGT → peaker breakpoints are all exercised over a normal day.
         let turbines = vec![
             // Modern CCGTs: efficient, cheap, mid-merit.
             GasPeaker::from_srmc(
                 "ccgt-1",
                 TurbineKind::Ccgt,
-                100.0,
+                7.0,
                 GasSrmc {
                     fuel_eur_per_mwh_th: 35.0,
                     efficiency: 0.58,
@@ -44,7 +48,7 @@ impl Fleet {
             GasPeaker::from_srmc(
                 "ccgt-2",
                 TurbineKind::Ccgt,
-                80.0,
+                4.0,
                 GasSrmc {
                     fuel_eur_per_mwh_th: 38.0,
                     efficiency: 0.55,
@@ -57,7 +61,7 @@ impl Fleet {
             GasPeaker::from_srmc(
                 "ocgt-1",
                 TurbineKind::Ocgt,
-                60.0,
+                3.0,
                 GasSrmc {
                     fuel_eur_per_mwh_th: 40.0,
                     efficiency: 0.40,
@@ -69,7 +73,7 @@ impl Fleet {
             GasPeaker::from_srmc(
                 "ocgt-2",
                 TurbineKind::Ocgt,
-                40.0,
+                2.5,
                 GasSrmc {
                     fuel_eur_per_mwh_th: 55.0,
                     efficiency: 0.35,
@@ -80,7 +84,14 @@ impl Fleet {
             ),
             // The deliberately expensive last-resort peaker (23 ct/kWh) that the
             // user specified: only economics makes it run.
-            GasPeaker::new("peaker", TurbineKind::Ocgt, GasConfig::default()),
+            GasPeaker::new(
+                "peaker",
+                TurbineKind::Ocgt,
+                GasConfig {
+                    capacity_mw: 1.5,
+                    ..GasConfig::default()
+                },
+            ),
         ];
 
         let mk = |cap_mwh: f64, power_mw: f64, rt: f64, half: f64| {

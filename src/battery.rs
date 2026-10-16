@@ -34,6 +34,14 @@ pub struct BatteryConfig {
     pub ewma_alpha: f64,
     /// The delivery slot the quote is sized for, in hours.
     pub slot_hours: f64,
+    /// Highest price the battery will pay to charge (EUR/MWh). Along with
+    /// `discharge_floor_eur` this anchors the fair mid to a sane *arbitrage band*,
+    /// so that even when the public tape collapses toward zero on a
+    /// renewables-flooded book the battery still knows stored energy is worth
+    /// discharging for and that charging is cheap.
+    pub charge_ceiling_eur: f64,
+    /// Lowest price the battery will accept to discharge (EUR/MWh).
+    pub discharge_floor_eur: f64,
 }
 
 impl Default for BatteryConfig {
@@ -47,6 +55,8 @@ impl Default for BatteryConfig {
             initial_fair_eur: 80.0,
             ewma_alpha: 0.25,
             slot_hours: 1.0 / 60.0, // 1-minute slots
+            charge_ceiling_eur: 30.0,
+            discharge_floor_eur: 80.0,
         }
     }
 }
@@ -90,6 +100,13 @@ impl Battery {
         self.cfg.round_trip_eff.sqrt().clamp(0.5, 1.0)
     }
 
+    /// Re-size the quote for a different delivery slot (the city uses 5 s slots).
+    pub fn set_slot_seconds(&mut self, seconds: f64) {
+        if seconds > 0.0 {
+            self.cfg.slot_hours = seconds / 3600.0;
+        }
+    }
+
     /// Update the fair mid from a public trade print.
     pub fn observe_trade(&mut self, price_eur: f64) {
         let a = self.cfg.ewma_alpha.clamp(0.001, 1.0);
@@ -98,23 +115,32 @@ impl Battery {
 
     /// The two-sided quote for the current inventory and fair mid.
     ///
-    /// Economical by construction: it never bids at or above its fair value and
-    /// never asks at or below it, so every round trip captures at least the
-    /// spread, and it never discharges below its own (loss-adjusted) cost basis.
+    /// Economical by construction:
+    ///   * the fair mid is first clamped into the `[charge_ceiling, discharge_floor]`
+    ///     arbitrage band, so a tape that collapses toward zero cannot convince the
+    ///     battery that stored energy is worthless — it still charges below the
+    ///     ceiling and discharges above the floor;
+    ///   * inventory skew then nudges the band (keen to buy when empty, keen to sell
+    ///     when full), bounded by the ceiling/floor;
+    ///   * it never discharges below its own loss-adjusted cost basis.
     pub fn quote(&self) -> Quote {
         let inv = if self.cfg.capacity_mwh > 0.0 {
             (self.soc_mwh / self.cfg.capacity_mwh).clamp(0.0, 1.0)
         } else {
             0.5
         };
-        // -skew when empty (keen to buy), +skew when full (keen to sell). The
-        // skew only nudges the centre; the clamps below keep the quotes honest.
+        // -skew when empty (keen to buy), +skew when full (keen to sell).
         let skew = self.cfg.skew_eur * (2.0 * inv - 1.0);
         let tick_eur = crate::wire::TICK as f64 / PRICE_SCALE as f64;
 
-        // Never buy at/above fair, never sell at/below fair.
-        let mut bid = (self.fair_eur - self.cfg.half_spread_eur - skew).min(self.fair_eur - tick_eur);
-        let mut ask = (self.fair_eur + self.cfg.half_spread_eur - skew).max(self.fair_eur + tick_eur);
+        // Anchor the mid to the arbitrage band (see doc comment).
+        let fair = self
+            .fair_eur
+            .clamp(self.cfg.charge_ceiling_eur, self.cfg.discharge_floor_eur);
+
+        // Never pay more than the charge ceiling, never sell below the discharge floor.
+        let mut bid = (fair - self.cfg.half_spread_eur - skew).min(self.cfg.charge_ceiling_eur);
+        let mut ask = (fair + self.cfg.half_spread_eur - skew).max(self.cfg.discharge_floor_eur);
 
         // Do not sell below the round-trip opportunity cost of what it holds:
         // it must cover purchase price / round-trip efficiency.
@@ -204,27 +230,39 @@ mod tests {
     }
 
     #[test]
-    fn never_buys_at_or_above_fair_and_never_sells_at_or_below_fair() {
-        // Across the whole SOC range, the quotes stay economically honest.
+    fn bids_at_or_below_the_charge_ceiling_and_asks_at_or_above_the_floor() {
+        // Across the whole SOC range the quotes stay inside the arbitrage band, so
+        // a collapsed tape cannot stop the battery charging on cheap energy.
         for step in 0..=10 {
             let mut b = Battery::new(cfg());
             b.soc_mwh = b.cfg.capacity_mwh * step as f64 / 10.0;
             b.fair_eur = 120.0;
             let q = b.quote();
-            let fair = crate::wire::eur_to_price(120.0);
+            let ceiling = crate::wire::eur_to_price(30.0);
+            let floor = crate::wire::eur_to_price(80.0);
             assert!(
-                q.bid_price < fair || q.bid_quantity == 0,
-                "bid {} >= fair {}",
-                q.bid_price,
-                fair
+                q.bid_price <= ceiling || q.bid_quantity == 0,
+                "bid {} above the charge ceiling",
+                q.bid_price
             );
             assert!(
-                q.ask_price > fair || q.ask_quantity == 0,
-                "ask {} <= fair {}",
-                q.ask_price,
-                fair
+                q.ask_price >= floor || q.ask_quantity == 0,
+                "ask {} below the discharge floor",
+                q.ask_price
             );
         }
+    }
+
+    #[test]
+    fn a_collapsed_tape_still_makes_the_battery_want_to_charge() {
+        // Regression: on a renewables-flooded book the tape EWMA collapses toward
+        // zero; the band anchor must keep the bid positive so the battery absorbs
+        // the cheap energy instead of refusing to charge.
+        let mut b = Battery::new(cfg());
+        b.fair_eur = 0.5;
+        let q = b.quote();
+        assert!(q.bid_price > 0, "collapsed tape must not zero the bid");
+        assert!(q.bid_quantity > 0, "a half-empty battery still bids to charge");
     }
 
     #[test]
@@ -251,8 +289,14 @@ mod tests {
         empty.soc_mwh = 0.0;
         let mut full = Battery::new(cfg());
         full.soc_mwh = full.cfg.capacity_mwh;
-        // When empty, both prices are skewed up (keen to buy); when full, down.
+        // With the mid inside the band the skew shows on the bid: an empty battery
+        // (keen to buy) bids higher than a full one.
+        empty.fair_eur = 45.0;
+        full.fair_eur = 45.0;
         assert!(empty.quote().bid_price > full.quote().bid_price);
+        // A high tape lifts both asks; the empty battery's skew keeps it higher.
+        empty.fair_eur = 200.0;
+        full.fair_eur = 200.0;
         assert!(empty.quote().ask_price > full.quote().ask_price);
     }
 
